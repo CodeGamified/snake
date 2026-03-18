@@ -12,6 +12,7 @@ using CodeGamified.Quality;
 using CodeGamified.Bootstrap;
 using Snake.Game;
 using Snake.Scripting;
+using Snake.UI;
 
 namespace Snake.Core
 {
@@ -72,6 +73,12 @@ namespace Snake.Core
         private SnakeMatchManager _match;
         private SnakeProgram _playerProgram;
 
+        // Trail
+        private SnakeHeadTrail _headTrail;
+
+        // TUI
+        private SnakeTUIManager _tuiManager;
+
         // Camera
         private CameraAmbientMotion _cameraSway;
 
@@ -117,10 +124,12 @@ namespace Snake.Core
             CreateGrid();
             CreateMatchManager();
             CreateBoardRenderer();
+            CreateHeadTrail();
             CreateInputProvider();
 
             if (enableScripting) CreatePlayerProgram();
 
+            CreateTUI();
             WireEvents();
             StartCoroutine(RunBootSequence());
         }
@@ -230,7 +239,20 @@ namespace Snake.Core
         {
             _boardRenderer = _grid.gameObject.AddComponent<SnakeBoardRenderer>();
             _boardRenderer.Initialize(_grid);
-            Log("Created BoardRenderer (3D cubes, walls)");
+            _boardRenderer.CreateHeadLight();
+            Log("Created BoardRenderer (3D cubes, walls + head glow)");
+        }
+
+        // =================================================================
+        // HEAD TRAIL
+        // =================================================================
+
+        private void CreateHeadTrail()
+        {
+            var go = new GameObject("HeadTrail");
+            _headTrail = go.AddComponent<SnakeHeadTrail>();
+            _headTrail.Initialize(_grid, SnakeBoardRenderer.SnakeHeadColor);
+            Log("Created HeadTrail (snake head trail)");
         }
 
         // =================================================================
@@ -257,6 +279,18 @@ namespace Snake.Core
         }
 
         // =================================================================
+        // TUI (.engine powered)
+        // =================================================================
+
+        private void CreateTUI()
+        {
+            var go = new GameObject("SnakeTUI");
+            _tuiManager = go.AddComponent<SnakeTUIManager>();
+            _tuiManager.Initialize(_match, _playerProgram);
+            Log("Created TUI (left debugger + right status panel)");
+        }
+
+        // =================================================================
         // EVENT WIRING
         // =================================================================
 
@@ -270,22 +304,55 @@ namespace Snake.Core
 
             if (_match != null)
             {
-                _match.OnMatchStarted += () => Log("MATCH STARTED");
+                _match.OnMatchStarted += () =>
+                {
+                    Log("MATCH STARTED");
+                    _boardRenderer?.MarkDirty();
+                    _headTrail?.ClearLine();
+                };
 
                 _match.OnFoodEaten += score =>
                 {
                     Log($"NOM! │ Score: {score} │ Length: {_grid.Body.Count}");
                     _boardRenderer?.MarkDirty();
+
+                    // Flash food cell with glow
+                    var foodPos = _grid.FoodPos;
+                    _boardRenderer?.FlashFoodEaten(foodPos.row, foodPos.col);
+
+                    // Head glow on food eat — bright red burst
+                    _boardRenderer?.FlashHeadLight(2.5f, SnakeBoardRenderer.FoodColor);
+                    _boardRenderer?.FlashHeadColor(4f);
+
+                    // Trail color changes with each eat
+                    Color trailHDR = new Color(
+                        SnakeBoardRenderer.FoodColor.r * 3f,
+                        SnakeBoardRenderer.FoodColor.g * 3f,
+                        SnakeBoardRenderer.FoodColor.b * 3f);
+                    _headTrail?.SetColor(trailHDR);
                 };
 
                 _match.OnGameOver += () =>
                 {
                     Log($"GAME OVER │ Score: {_match.Score} │ Length: {_grid.Body.Count} │ High: {_match.HighScore}");
+
+                    // Death flash — big red
+                    _boardRenderer?.FlashHeadLight(4f, Color.red);
+                    _boardRenderer?.FlashHeadColor(6f);
+                    _headTrail?.ClearLine();
+
                     if (autoRestart)
                         StartCoroutine(RestartAfterDelay());
                 };
 
-                _match.OnSnakeStepped += () => _boardRenderer?.MarkDirty();
+                _match.OnSnakeStepped += () =>
+                {
+                    _boardRenderer?.MarkDirty();
+
+                    // Subtle head pulse each step
+                    _boardRenderer?.FlashHeadLight(0.8f, SnakeBoardRenderer.SnakeHeadColor);
+                    _boardRenderer?.FlashHeadColor(1.5f);
+                };
             }
         }
 
