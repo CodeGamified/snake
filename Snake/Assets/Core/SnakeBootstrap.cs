@@ -240,7 +240,8 @@ namespace Snake.Core
             _boardRenderer = _grid.gameObject.AddComponent<SnakeBoardRenderer>();
             _boardRenderer.Initialize(_grid);
             _boardRenderer.CreateHeadLight();
-            Log("Created BoardRenderer (3D cubes, walls + head glow)");
+            _boardRenderer.CreateFoodLight();
+            Log("Created BoardRenderer (snake cubes, floor, walls + head/food glow)");
         }
 
         // =================================================================
@@ -316,9 +317,8 @@ namespace Snake.Core
                     Log($"NOM! │ Score: {score} │ Length: {_grid.Body.Count}");
                     _boardRenderer?.MarkDirty();
 
-                    // Flash food cell with glow
-                    var foodPos = _grid.FoodPos;
-                    _boardRenderer?.FlashFoodEaten(foodPos.row, foodPos.col);
+                    // Flash food cube + food light
+                    _boardRenderer?.FlashFoodEaten();
 
                     // Head glow on food eat — bright red burst
                     _boardRenderer?.FlashHeadLight(2.5f, SnakeBoardRenderer.FoodColor);

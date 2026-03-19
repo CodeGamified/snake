@@ -1,6 +1,5 @@
 // Copyright CodeGamified 2025-2026
 // MIT License — Snake
-using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using CodeGamified.Quality;
@@ -8,17 +7,24 @@ using CodeGamified.Quality;
 namespace Snake.Game
 {
     /// <summary>
-    /// Visual renderer for the Snake grid — 3D cube cells.
-    /// Renders grid cells (empty, food, snake head, snake body) each frame.
-    /// Uses a flat object pool — all cells pre-created and toggled.
-    /// Glow system: head point light + HDR emission flashing.
+    /// Visual renderer for the Snake grid.
+    /// Only creates GameObjects for the snake body, food, floor, and frame walls.
+    /// Glow system: head point light + food point light (pulsing) + HDR emission.
     /// </summary>
     public class SnakeBoardRenderer : MonoBehaviour, IQualityResponsive
     {
         private SnakeGrid _grid;
 
-        // Cell GameObjects — flat pool [row * Width + col]
-        private GameObject[] _cellObjects;
+        // Snake segment cubes — dynamically pooled (only head + body)
+        private readonly List<GameObject> _snakeCubePool = new();
+        private readonly List<Renderer> _snakeCubeRenderers = new();
+
+        // Food — single cube
+        private GameObject _foodCube;
+        private Renderer _foodRenderer;
+
+        // Floor — single plane replacing hundreds of empty-cell cubes
+        private GameObject _floorPlane;
 
         // Frame/border
         private GameObject _frameObject;
@@ -33,7 +39,6 @@ namespace Snake.Game
         public static readonly Color SnakeHeadColor = new Color(0f, 1f, 0.4f);     // bright green
         public static readonly Color SnakeBodyColor = new Color(0f, 0.7f, 0.3f);    // green
         public static readonly Color FoodColor      = new Color(1f, 0.2f, 0.2f);    // red
-        private static readonly Color EmptyColor     = new Color(0.03f, 0.03f, 0.06f); // near-black
         private static readonly Color FrameColor     = new Color(0.3f, 0.3f, 0.4f);
 
         // ── Glow system ──────────────────────────────────────────
@@ -41,29 +46,29 @@ namespace Snake.Game
         private const float HeadLightBaseIntensity = 0.3f;
         private const float HeadLightDecay = 3f;
 
+        private Light _foodLight;
+        private const float FoodLightBaseIntensity = 0.6f;
+        private const float FoodLightRange = 2.5f;
+        private float _foodPulsePhase;
+
         // Track flashed renderers for decay back to base color
         private readonly List<(Renderer renderer, Color baseColor)> _flashedRenderers = new();
-
-        // Food eat glow coroutines
-        private readonly Dictionary<GameObject, Coroutine> _cellGlowCoroutines = new();
 
         public void Initialize(SnakeGrid grid)
         {
             _grid = grid;
 
-            int total = _grid.Height * _grid.Width;
-            _cellObjects = new GameObject[total];
+            // Single floor plane replaces per-cell empty cubes
+            BuildFloor();
 
-            for (int r = 0; r < _grid.Height; r++)
-            {
-                for (int c = 0; c < _grid.Width; c++)
-                {
-                    int idx = r * _grid.Width + c;
-                    var go = CreateCellObject($"Cell_{r}_{c}");
-                    go.transform.localPosition = CellToWorld(r, c);
-                    _cellObjects[idx] = go;
-                }
-            }
+            // Food cube — single object
+            _foodCube = CreateCube("Food");
+            _foodRenderer = _foodCube.GetComponent<Renderer>();
+            _foodCube.SetActive(false);
+
+            // Pre-allocate snake cube pool for initial body size
+            for (int i = 0; i < _grid.Body.Count + 4; i++)
+                GrowPool();
 
             BuildFrame();
 
@@ -77,6 +82,7 @@ namespace Snake.Game
         private void LateUpdate()
         {
             DecayHeadLight();
+            DecayFoodLight();
             DecayFlashedRenderers();
 
             if (!_dirty) return;
@@ -92,39 +98,46 @@ namespace Snake.Game
 
         private void RenderGrid()
         {
-            for (int r = 0; r < _grid.Height; r++)
+            // Ensure pool is big enough for current snake length
+            while (_snakeCubePool.Count < _grid.Body.Count)
+                GrowPool();
+
+            // Render snake segments (head at index 0)
+            for (int i = 0; i < _grid.Body.Count; i++)
             {
-                for (int c = 0; c < _grid.Width; c++)
-                {
-                    int idx = r * _grid.Width + c;
-                    int val = _grid.Grid[r, c];
-                    var go = _cellObjects[idx];
+                var (row, col) = _grid.Body[i];
+                var go = _snakeCubePool[i];
+                go.SetActive(true);
 
-                    Color color = val switch
-                    {
-                        1 => FoodColor,
-                        2 => SnakeHeadColor,
-                        3 => SnakeBodyColor,
-                        _ => EmptyColor
-                    };
+                bool isHead = (i == 0);
+                Color color = isHead ? SnakeHeadColor : SnakeBodyColor;
+                float heightScale = isHead ? CellSize * 0.95f : CellSize * 0.85f;
 
-                    float scale = val switch
-                    {
-                        1 => CellSize * 0.7f,  // food slightly smaller
-                        2 => CellSize * 0.95f,  // head prominent
-                        3 => CellSize * 0.85f,  // body segments
-                        _ => CellSize * 0.1f     // empty = thin floor tile
-                    };
+                go.transform.localPosition = CellToWorld(row, col, heightScale * 0.5f);
+                go.transform.localScale = new Vector3(CellSize * 0.9f, heightScale, CellSize * 0.9f);
+                SetCellColor(go, color);
+            }
 
-                    go.transform.localScale = new Vector3(
-                        val > 0 ? CellSize * 0.9f : CellSize * 0.95f,
-                        scale,
-                        val > 0 ? CellSize * 0.9f : CellSize * 0.95f);
+            // Hide unused pool cubes
+            for (int i = _grid.Body.Count; i < _snakeCubePool.Count; i++)
+                _snakeCubePool[i].SetActive(false);
 
-                    go.transform.localPosition = CellToWorld(r, c, val > 0 ? scale * 0.5f : 0.01f);
-                    SetCellColor(go, color);
-                    go.SetActive(true);
-                }
+            // Render food
+            if (_foodCube != null && !_grid.IsDead)
+            {
+                var (fr, fc) = _grid.FoodPos;
+                float foodScale = CellSize * 0.7f;
+                _foodCube.transform.localPosition = CellToWorld(fr, fc, foodScale * 0.5f);
+                _foodCube.transform.localScale = new Vector3(CellSize * 0.9f, foodScale, CellSize * 0.9f);
+
+                // Food always renders with HDR emission for bloom glow
+                Color foodHDR = new Color(FoodColor.r * 2f, FoodColor.g * 2f, FoodColor.b * 2f);
+                SetHDRColorMat(_foodRenderer.material, foodHDR);
+                _foodCube.SetActive(true);
+            }
+            else if (_foodCube != null)
+            {
+                _foodCube.SetActive(false);
             }
         }
 
@@ -140,7 +153,7 @@ namespace Snake.Game
                 row * CellSize + CellSize * 0.5f);
         }
 
-        private GameObject CreateCellObject(string name)
+        private GameObject CreateCube(string name)
         {
             var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
             go.name = name;
@@ -151,6 +164,29 @@ namespace Snake.Game
             if (col != null) Destroy(col);
 
             return go;
+        }
+
+        private void GrowPool()
+        {
+            int idx = _snakeCubePool.Count;
+            var go = CreateCube($"Snake_{idx}");
+            go.SetActive(false);
+            _snakeCubePool.Add(go);
+            _snakeCubeRenderers.Add(go.GetComponent<Renderer>());
+        }
+
+        private void BuildFloor()
+        {
+            _floorPlane = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            _floorPlane.name = "Floor";
+            _floorPlane.transform.SetParent(transform, false);
+            float boardW = _grid.Width * CellSize;
+            float boardH = _grid.Height * CellSize;
+            _floorPlane.transform.localPosition = new Vector3(boardW * 0.5f, -0.01f, boardH * 0.5f);
+            _floorPlane.transform.localScale = new Vector3(boardW, 0.02f, boardH);
+            var col = _floorPlane.GetComponent<Collider>();
+            if (col != null) Destroy(col);
+            SetCellColor(_floorPlane, new Color(0.03f, 0.03f, 0.06f));
         }
 
         private void SetCellColor(GameObject go, Color color)
@@ -182,6 +218,20 @@ namespace Snake.Game
             _headLight.shadows = LightShadows.None;
         }
 
+        /// <summary>Create a point light on the food. Pulses gently in LateUpdate.</summary>
+        public void CreateFoodLight()
+        {
+            if (_foodLight != null) return;
+            var lightGO = new GameObject("FoodGlow");
+            lightGO.transform.SetParent(transform, false);
+            _foodLight = lightGO.AddComponent<Light>();
+            _foodLight.type = LightType.Point;
+            _foodLight.range = FoodLightRange;
+            _foodLight.intensity = FoodLightBaseIntensity;
+            _foodLight.color = FoodColor;
+            _foodLight.shadows = LightShadows.None;
+        }
+
         /// <summary>Flash the head light to a high intensity + color.</summary>
         public void FlashHeadLight(float intensity, Color color)
         {
@@ -191,14 +241,21 @@ namespace Snake.Game
             _headLight.range = 3f + intensity * 0.4f;
         }
 
+        /// <summary>Flash the food light to a high intensity.</summary>
+        public void FlashFoodLight(float intensity, Color color)
+        {
+            if (_foodLight == null) return;
+            _foodLight.intensity = intensity;
+            _foodLight.color = color;
+            _foodLight.range = FoodLightRange + intensity * 0.3f;
+        }
+
         /// <summary>Flash the head cell material to HDR bloom burst.</summary>
         public void FlashHeadColor(float boostMultiplier)
         {
             if (_grid == null || _grid.Body.Count == 0) return;
-            var head = _grid.Body[0];
-            int idx = head.row * _grid.Width + head.col;
-            if (idx < 0 || idx >= _cellObjects.Length) return;
-            var go = _cellObjects[idx];
+            if (_snakeCubePool.Count == 0) return;
+            var go = _snakeCubePool[0]; // head is always index 0
             if (go == null) return;
             Color boosted = new Color(SnakeHeadColor.r * boostMultiplier,
                                        SnakeHeadColor.g * boostMultiplier,
@@ -206,52 +263,17 @@ namespace Snake.Game
             SetHDRColor(go, boosted);
         }
 
-        /// <summary>Flash a food cell with glow when eaten.</summary>
-        public void FlashFoodEaten(int row, int col)
+        /// <summary>Flash the food cube + food light when eaten.</summary>
+        public void FlashFoodEaten()
         {
-            int idx = row * _grid.Width + col;
-            if (idx < 0 || idx >= _cellObjects.Length) return;
-            var go = _cellObjects[idx];
-            if (go == null) return;
+            if (_foodCube == null || _foodRenderer == null) return;
 
-            if (_cellGlowCoroutines.TryGetValue(go, out var existing))
-            {
-                if (existing != null) StopCoroutine(existing);
-                _cellGlowCoroutines.Remove(go);
-            }
+            // Flash food cube HDR
+            Color hdr = new Color(FoodColor.r * 6f, FoodColor.g * 6f, FoodColor.b * 6f);
+            FlashRenderer(_foodCube, hdr, FoodColor);
 
-            var c = StartCoroutine(FoodEatGlow(go));
-            _cellGlowCoroutines[go] = c;
-        }
-
-        /// <summary>Flash any cell renderer with HDR color, then decay back.</summary>
-        public void FlashCellGlow(int row, int col, Color hdrColor, Color baseColor)
-        {
-            int idx = row * _grid.Width + col;
-            if (idx < 0 || idx >= _cellObjects.Length) return;
-            var go = _cellObjects[idx];
-            if (go == null) return;
-            FlashRenderer(go, hdrColor, baseColor);
-        }
-
-        private IEnumerator FoodEatGlow(GameObject go)
-        {
-            Color hdr = new Color(FoodColor.r * 5f, FoodColor.g * 5f, FoodColor.b * 5f);
-            SetHDRColor(go, hdr);
-
-            float elapsed = 0f;
-            const float glowDuration = 0.2f;
-            while (elapsed < glowDuration)
-            {
-                elapsed += Time.deltaTime;
-                float t = elapsed / glowDuration;
-                Color faded = Color.Lerp(hdr, EmptyColor, t);
-                SetHDRColor(go, faded);
-                yield return null;
-            }
-
-            SetHDRColor(go, EmptyColor);
-            _cellGlowCoroutines.Remove(go);
+            // Flash food light
+            FlashFoodLight(3f, FoodColor);
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -271,6 +293,28 @@ namespace Snake.Game
             {
                 var head = _grid.Body[0];
                 _headLight.transform.localPosition = CellToWorld(head.row, head.col, CellSize);
+            }
+        }
+
+        private void DecayFoodLight()
+        {
+            if (_foodLight == null) return;
+
+            // Gentle pulse
+            _foodPulsePhase += Time.unscaledDeltaTime * 3f;
+            float pulse = FoodLightBaseIntensity + Mathf.Sin(_foodPulsePhase) * 0.15f;
+
+            // Decay flash intensity back toward pulse baseline
+            float decay = Mathf.Clamp01(HeadLightDecay * Time.unscaledDeltaTime);
+            _foodLight.intensity = Mathf.Lerp(_foodLight.intensity, pulse, decay);
+            _foodLight.color = Color.Lerp(_foodLight.color, FoodColor, decay);
+            _foodLight.range = Mathf.Lerp(_foodLight.range, FoodLightRange, decay);
+
+            // Move light to food position
+            if (_grid != null)
+            {
+                var (fr, fc) = _grid.FoodPos;
+                _foodLight.transform.localPosition = CellToWorld(fr, fc, CellSize);
             }
         }
 
